@@ -314,7 +314,7 @@ WHERE LOWER(t.RECURRINGPAYMENTFREQUENCY) = 'monthly'
 AND   LOWER(dp.operationssubgroup) NOT IN ('annual')
 AND   LOWER(dp.productname) LIKE '%member%' --Removed 358 TICKETIDs associated to products that are NOT a Membership
 AND   LOWER(dp.productname) NOT LIKE '%membership activation fee'
---AND LOCATIONID = 'Apex, NC - 151'
+
 -- Deduplicates TICKETIDs that map to multiple SK_TICKETs (duplicated memberships in Roller).
 -- Keeps the row with customer data over NULL. Uncomment if downstream tools cannot handle duplicate TICKETIDs.
 --QUALIFY ROW_NUMBER() OVER (
