@@ -146,7 +146,8 @@ mbr_tick_cancel_logic AS (
         FROM mbr_tick_last_event
         WHERE LAST_EVENT IN ('Upgraded From Active', 'Upgraded From Inactive')
 ),
--- Secondary CTE for saftey to ensure only one cancel event is captured per member sk_ticket in the previous union CTE. No cases were found where multiple cancel events existed for the same member sk_ticket. If multiple cancel events do exist for the same member sk_ticket, this logic will keep the most recent cancel event.
+--Secondary CTE for saftey to ensure only one cancel event is captured per member sk_ticket in the previous union CTE. No cases were found where multiple cancel events existed. 
+--If multiple cancel events do exist for the same member sk_ticket, this logic will keep the most recent cancel event.
 mbr_tick_cancel_event AS (
   SELECT 
     *
@@ -176,7 +177,8 @@ mbr_tick_active_status AS (
           END AS TERM_DATE
         , CASE
             WHEN l.MBR_TICK_STATUS = 0 THEN 0
-            --Use COALESCE(LAST_RECURR_PAY_DATE, JOIN_SK_DATE) to catch members Roller still marks active but who have lapsed: if today is 33+ days (dunning payment failure process begins) past the last recurring payment / member join date, the member is treated as inactive. Only applied to monthly recurring memberships.
+            --Use COALESCE(LAST_RECURR_PAY_DATE, JOIN_SK_DATE) to catch members Roller still marks active but who have lapsed. Only applied to monthly recurring memberships. 
+            --if today is 33+ days (dunning payment failure process begins) past the last recurring payment / member join date, the member is treated as inactive. 
             WHEN LOWER(t.RECURRINGPAYMENTFREQUENCY) = 'monthly'
              AND CURRENT_DATE >= DATEADD(DAY, 33, COALESCE(rd.LAST_RECURR_PAY_DATE, j.JOIN_SK_DATE)) THEN 0
             ELSE 1
@@ -234,12 +236,14 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
     , u.UPGRADE_DATE AS SK_UPGRADE_DATE
     , c.CANCEL_DATE AS SK_ATTRITION_DATE
     , r.MAX_REFUND_SK_DATE AS SK_LAST_REFUND_DATE
+    --If a member ticket has a payment issue, refund, or upgrade the account is closed so use the cancel date from the cancel event table. 
+    --If there is no payment issue but there is a cancel date from the term event table, then use that date. If there is no cancellation, then term_date is null.
     , CASE
         WHEN c.CANCEL_ACTION = 'Payment Issue' THEN c.CANCEL_DATE
         WHEN c.CANCEL_ACTION = 'Refund' THEN c.CANCEL_DATE
         WHEN c.CANCEL_ACTION = 'Upgraded' THEN c.CANCEL_DATE
         ELSE tm.TERM_SK_DATE
-      END AS SK_TERMINATION_DATE -- If a member ticket has a payment issue, refund, or upgrade the account is closed so use the cancel date from the cancel event table. If there is no payment issue but there is a cancel date from the term event table, then use that date. If there is no cancellation, then term_date is null.
+      END AS SK_TERMINATION_DATE 
     , dl.BUSINESSGROUP AS BUSINESS_GROUP
     , dl.LOCATIONID
     , t.TICKETID
@@ -247,7 +251,7 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
     , t.CUSTOMTICKETID
     , j.BOOKINGITEMID
     , db.BOOKINGLOCATIONSTANDARDIZED AS CONV_TYPE
-    , act.LAST_EVENT AS CURRENT_STATUS
+    , act.LAST_EVENT AS LAST_STATUS
     , purch_dc.CUSTOMERID AS PURCH_CUSTOMER
     , jump_dc.CUSTOMERID AS JUMPER_CUSTOMER 
     , dp.PRODUCTID   AS PRODUCTID
@@ -260,6 +264,7 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
     , t.recurringpaymentfrequency AS pay_freq 
     , a.ATTENDANCE_DAYS
     , c.CANCEL_ACTION AS ATTRITION_REASON
+    --The number of days between join and cancellation used for attrition and retention analysis. If there is no cancellation, then this value is null.
     , CASE 
         WHEN c.CANCEL_DATE IS NULL THEN NULL
         ELSE GREATEST(
@@ -270,15 +275,15 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
                 TO_DATE(c.CANCEL_DATE)
             )
         )
-      END AS ATTRITION_DAYS --The number of days between join and cancellation used for attrition and retention analysis. If there is no cancellation, then this value is null.
+      END AS ATTRITION_DAYS 
     , r.REFUND_REQUESTS
+    --Override the member ticket active status if the ticket has a cancel, term, or upgrade event to indicate the member is no longer active. 1 = active; 0 = inactive. 
+    --This metric is for future use to forecast coming attrition and potentially use to provide benefits to keep the member active.
     , CASE    
         WHEN c.CANCEL_ACTION IS NOT NULL THEN 0
         ELSE 1
       END AS PROJ_RETENTION_STATUS
-    , 
-    -- Override the member ticket active status if the ticket has a cancel, term, or upgrade event to indicate the member is no longer active. 1 = active; 0 = inactive. Use Roller active as the default metric for active member count. This metric is for future use to forecast coming attrition and potentially use to provide benefits to keep the member active.
-    act.MBR_TICK_STATUS AS ACTIVE_STATUS  
+    , act.MBR_TICK_STATUS AS ACTIVE_STATUS  
 FROM GOLD_DB.DW.DIMTICKET t
 INNER JOIN mbr_tick_join_event j  
     ON t.SK_TICKET = j.SK_TICKET
@@ -306,20 +311,15 @@ LEFT JOIN GOLD_DB.DW.DIMLOCATION dl
     ON dr.SK_LOCATION = dl.SK_LOCATION
 LEFT JOIN GOLD_DB.DW.DIMBOOKING db
     ON dr.SK_BOOKING = db.SK_BOOKING
+-- FactRev sometimes has null sk_customer, so attendance is used as a backup to join to the customer dimension. ONCE THIS BUG IS SOLVED WE CAN REMOVE THE COLAESCE CLAUSE
 LEFT JOIN GOLD_DB.DW.DIMCUSTOMER purch_dc
-    ON COALESCE(NULLIF(dr.SK_CUSTOMER, -1), a.SK_PURCHASINGCUSTOMER) = purch_dc.SK_CUSTOMER -- FactRev sometimes has null sk_customer, so attendance is used as a backup to join to the customer dimension. ONCE THIS BUG IS SOLVED WE CAN REMOVE THE COLAESCE CLAUSE
+    ON COALESCE(NULLIF(dr.SK_CUSTOMER, -1), a.SK_PURCHASINGCUSTOMER) = purch_dc.SK_CUSTOMER 
 LEFT JOIN GOLD_DB.DW.DIMCUSTOMER jump_dc
     ON a.SK_JUMPERCUSTOMER = jump_dc.SK_CUSTOMER
 WHERE LOWER(t.RECURRINGPAYMENTFREQUENCY) = 'monthly'
+AND LOCATIONID = 'Apex, NC - 151'
 AND   LOWER(dp.operationssubgroup) NOT IN ('annual')
 AND   LOWER(dp.productname) LIKE '%member%' --Removed 358 TICKETIDs associated to products that are NOT a Membership
 AND   LOWER(dp.productname) NOT LIKE '%membership activation fee'
-
--- Deduplicates TICKETIDs that map to multiple SK_TICKETs (duplicated memberships in Roller).
--- Keeps the row with customer data over NULL. Uncomment if downstream tools cannot handle duplicate TICKETIDs.
---QUALIFY ROW_NUMBER() OVER (
---    PARTITION BY t.TICKETID
---    ORDER BY purch_dc.CUSTOMERID DESC NULLS LAST
---) = 1
 ORDER BY j.JOIN_SK_DATE DESC, dl.LOCATIONID ASC
 ;
