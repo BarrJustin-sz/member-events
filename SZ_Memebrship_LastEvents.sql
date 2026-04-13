@@ -261,7 +261,7 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
     , rd.RECURR_AVG_DUES
     , rd.RECURR_PAY_COUNT
     , rd.LAST_RECURR_PAY_DATE
-    , t.recurringpaymentfrequency AS pay_freq 
+    , t.RECURRINGPAYMENTFREQUENCY AS PAY_FREQ
     , a.ATTENDANCE_DAYS
     , c.CANCEL_ACTION AS ATTRITION_REASON
     --The number of days between join and cancellation used for attrition and retention analysis. If there is no cancellation, then this value is null.
