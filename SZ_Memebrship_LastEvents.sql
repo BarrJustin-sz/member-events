@@ -251,7 +251,7 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
     , t.CUSTOMTICKETID
     , j.BOOKINGITEMID
     , db.BOOKINGLOCATIONSTANDARDIZED AS CONV_TYPE
-    , act.LAST_EVENT AS CURRENT_STATUS
+    , act.LAST_EVENT AS LAST_STATUS
     , purch_dc.CUSTOMERID AS PURCH_CUSTOMER
     , jump_dc.CUSTOMERID AS JUMPER_CUSTOMER 
     , dp.PRODUCTID   AS PRODUCTID
@@ -317,6 +317,7 @@ LEFT JOIN GOLD_DB.DW.DIMCUSTOMER purch_dc
 LEFT JOIN GOLD_DB.DW.DIMCUSTOMER jump_dc
     ON a.SK_JUMPERCUSTOMER = jump_dc.SK_CUSTOMER
 WHERE LOWER(t.RECURRINGPAYMENTFREQUENCY) = 'monthly'
+AND LOCATIONID = 'Apex, NC - 151'
 AND   LOWER(dp.operationssubgroup) NOT IN ('annual')
 AND   LOWER(dp.productname) LIKE '%member%' --Removed 358 TICKETIDs associated to products that are NOT a Membership
 AND   LOWER(dp.productname) NOT LIKE '%membership activation fee'
