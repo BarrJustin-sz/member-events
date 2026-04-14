@@ -286,11 +286,11 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
     , dr.SK_BOOKING
     , dr.SK_BOOKINGCREATEDBYEMPLOYEE
     , dr.SK_PAYMENTTAKENBYEMPLOYEE
-    , j.JOIN_SK_DATE AS SK_JOIN_DATE
-    , a.LAST_CHECKIN AS SK_LAST_CHECKIN
-    , u.UPGRADE_DATE AS SK_UPGRADE_DATE
-    , c.CANCEL_DATE AS SK_ATTRITION_DATE
-    , r.MAX_REFUND_SK_DATE AS SK_LAST_REFUND_DATE
+    , j.JOIN_SK_DATE AS JOIN_DATE
+    , a.LAST_CHECKIN AS LAST_CHECKIN
+    , u.UPGRADE_DATE AS UPGRADE_DATE
+    , c.CANCEL_DATE AS ATTRITION_DATE
+    , r.MAX_REFUND_SK_DATE AS LAST_REFUND_DATE
     --If a member ticket has a payment issue, refund, or upgrade the account is closed so use the cancel date from the cancel event table. 
     --If there is no payment issue but there is a cancel date from the term event table, then use that date. If there is no cancellation, then term_date is null.
     , CASE
@@ -299,7 +299,7 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
         WHEN c.CANCEL_ACTION = 'Upgraded' THEN c.CANCEL_DATE
         WHEN c.CANCEL_ACTION = 'Lapsed' THEN c.CANCEL_DATE
         ELSE tm.TERM_SK_DATE
-      END AS SK_TERMINATION_DATE
+      END AS TERMINATION_DATE
     , dl.BUSINESSGROUP AS BUSINESS_GROUP
     , dl.LOCATIONID
     , t.TICKETID
@@ -314,14 +314,14 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
     , dp.PRODUCTID   AS PRODUCTID
     , dp.PRODUCTNAME AS PRODUCT_NAME
     , dp.OPERATIONSSUBGROUP AS SUB_GROUP --Changelog Daniel
+    , t.RECURRINGPAYMENTFREQUENCY AS PAY_FREQ
     , ip.INITIAL_PAYMENT
     , rd.RECURR_AVG_DUES
     , rd.RECURR_PAY_COUNT
-    , rd.LAST_RECURR_PAY_DATE AS SK_LAST_RECURR_PAY_DATE 
-    , CASE 
-        WHEN act.MBR_TICK_STATUS = 1 THEN np.NEXT_RECURRING_PAYMENT_DATE 
-      END AS SK_NEXT_RECURR_PAY_DATE
-    , t.RECURRINGPAYMENTFREQUENCY AS PAY_FREQ
+    , rd.LAST_RECURR_PAY_DATE AS LAST_RECURR_PAY_DATE 
+    , CASE
+        WHEN c.CANCEL_ACTION IS NULL THEN np.NEXT_RECURRING_PAYMENT_DATE
+      END AS NEXT_RECURR_PAY_DATE
     , a.ATTENDANCE_DAYS
     , c.CANCEL_ACTION AS ATTRITION_REASON
     --The number of days between join and cancellation used for attrition and retention analysis. If there is no cancellation, then this value is null.
