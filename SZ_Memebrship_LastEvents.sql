@@ -242,8 +242,9 @@ mbr_tick_dim_rev AS (
         ORDER BY RECORDDATE DESC
     ) = 1   
 ),
---For each member sk_ticket forecast the next recurring payment date based on the creation day-of-month anchor. 
---Falls back to join date + 1 month for tickets with no recurring payments yet (new members in first cycle) and the last day of the next month to handle short months.
+--For each member sk_ticket forecast the next recurring payment date. Anchors to the last payment day (Roller locks billing to this day), falling back to join day for new members.
+--Clamped to the last day of the next month to handle short months (e.g. Jan 31 → Feb 28).
+--Note: Roller clamps recurring payments to the last day of the month and locks recurring to that day going forward (e.g. joined Jan 31, clamp to Feb 28, now recurr will be 28th every month thereafter).
 mbr_tick_next_payment AS (
     SELECT
           l.SK_TICKET
@@ -251,7 +252,7 @@ mbr_tick_next_payment AS (
             YEAR(DATEADD(MONTH, 1, COALESCE(rd.LAST_RECURR_PAY_DATE, j.JOIN_SK_DATE))),
             MONTH(DATEADD(MONTH, 1, COALESCE(rd.LAST_RECURR_PAY_DATE, j.JOIN_SK_DATE))),
             LEAST(
-                DAY(j.JOIN_SK_DATE),
+                DAY(COALESCE(rd.LAST_RECURR_PAY_DATE, j.JOIN_SK_DATE)),
                 DAY(LAST_DAY(DATEADD(MONTH, 1, COALESCE(rd.LAST_RECURR_PAY_DATE, j.JOIN_SK_DATE))))
             )
           ) AS NEXT_RECURRING_PAYMENT_DATE
