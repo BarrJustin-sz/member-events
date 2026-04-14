@@ -145,6 +145,24 @@ mbr_tick_cancel_logic AS (
             , LAST_SK_DATE AS CANCEL_DATE
         FROM mbr_tick_last_event
         WHERE LAST_EVENT IN ('Upgraded From Active', 'Upgraded From Inactive')
+    UNION ALL
+-- FIFTH SELECT - Identify monthly members Roller still marks active but 33+ days past their last recurring payment or join date.
+-- These are treated as lapsed and given a computed term date (last payment/join date + 33 days).
+-- UAT workaround: may reflect missing cancellation events in source data rather than true lapsed memberships; filter ATTRITION_REASON = 'Lapsed' to exclude when upstream data is corrected.
+        SELECT
+              l.SK_TICKET
+            , 'Lapsed' AS CANCEL_ACTION
+            , DATEADD(DAY, 33, COALESCE(rd.LAST_RECURR_PAY_DATE, j.JOIN_SK_DATE)) AS CANCEL_DATE
+        FROM mbr_tick_last_event l
+        LEFT JOIN GOLD_DB.DW.DIMTICKET t
+            ON l.SK_TICKET = t.SK_TICKET
+        LEFT JOIN mbr_tick_recurring_dues rd
+            ON l.SK_TICKET = rd.SK_TICKET
+        LEFT JOIN mbr_tick_join_event j
+            ON l.SK_TICKET = j.SK_TICKET
+        WHERE l.MBR_TICK_STATUS = 1
+            AND LOWER(t.RECURRINGPAYMENTFREQUENCY) = 'monthly'
+            AND CURRENT_DATE >= DATEADD(DAY, 33, COALESCE(rd.LAST_RECURR_PAY_DATE, j.JOIN_SK_DATE))
 ),
 --Secondary CTE for saftey to ensure only one cancel event is captured per member sk_ticket in the previous union CTE. No cases were found where multiple cancel events existed. 
 --If multiple cancel events do exist for the same member sk_ticket, this logic will keep the most recent cancel event.
@@ -157,14 +175,29 @@ mbr_tick_cancel_event AS (
     ORDER BY CANCEL_DATE DESC
   ) = 1
 ),
---For each member sk_ticket, identify the last event where rn = 1 and the event is 'Cancelled', 'Assumed Cancel', or 'Default Cancelled'.    
+--For each member sk_ticket, identify the last event where rn = 1 and the event is 'Cancelled', 'Assumed Cancel', or 'Default Cancelled'.
 mbr_tick_term_event AS (
-    SELECT 
+    SELECT
           SK_TICKET
         , SK_DATE AS TERM_SK_DATE
     FROM mbr_tick_events
-    WHERE rn = 1 
+    WHERE rn = 1
         AND EVENTTYPE IN ('Cancelled', 'Assumed Cancelled', 'Default Cancelled')
+    --UAT workaround: Roller sometimes records a same-day 'Pending Cancellation' with a later timestamp than the actual cancellation event,
+    --causing 'Pending Cancellation' to sort to rn = 1 and burying the cancellation at rn = 2 (e.g. tickets 5332521-11704773, 59259862-218388652).
+    --When rn = 1 is 'Pending Cancellation' and rn = 2 is a cancellation event on the same date, promote rn = 2 as the term date.
+    UNION ALL
+    SELECT
+          e2.SK_TICKET
+        , e2.SK_DATE AS TERM_SK_DATE
+    FROM mbr_tick_events e1
+    JOIN mbr_tick_events e2
+        ON e1.SK_TICKET = e2.SK_TICKET
+        AND e1.SK_DATE = e2.SK_DATE
+    WHERE e1.rn = 1
+        AND e1.EVENTTYPE = 'Pending Cancellation'
+        AND e2.rn = 2
+        AND e2.EVENTTYPE IN ('Cancelled', 'Assumed Cancelled', 'Default Cancelled')
 ),
 --For each member sk_ticket, identify if they are still active in Roller (active = 1; terminated = 0). If the member is still active then the status is 1 and term_date is null.
 mbr_tick_active_status AS (
@@ -242,8 +275,9 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
         WHEN c.CANCEL_ACTION = 'Payment Issue' THEN c.CANCEL_DATE
         WHEN c.CANCEL_ACTION = 'Refund' THEN c.CANCEL_DATE
         WHEN c.CANCEL_ACTION = 'Upgraded' THEN c.CANCEL_DATE
+        WHEN c.CANCEL_ACTION = 'Lapsed' THEN c.CANCEL_DATE
         ELSE tm.TERM_SK_DATE
-      END AS SK_TERMINATION_DATE 
+      END AS SK_TERMINATION_DATE
     , dl.BUSINESSGROUP AS BUSINESS_GROUP
     , dl.LOCATIONID
     , t.TICKETID
