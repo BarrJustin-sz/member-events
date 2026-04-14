@@ -224,7 +224,7 @@ mbr_tick_active_status AS (
     LEFT JOIN mbr_tick_join_event j
         ON l.SK_TICKET = j.SK_TICKET
 ),
--- For each member sk_ticket, add the sk_location, sk_customer (purchasing customer), sk_booking, sk_discount, sk_employee and sk_product dimensions to the most recent record. 
+--For each member sk_ticket, add the sk_location, sk_customer (purchasing customer), sk_booking, sk_discount, sk_employee and sk_product dimensions to the most recent record. 
 mbr_tick_dim_rev AS (
     SELECT 
           SK_TICKET
@@ -242,7 +242,29 @@ mbr_tick_dim_rev AS (
         ORDER BY RECORDDATE DESC
     ) = 1   
 ),
--- Add actual attendance to the record. Track the total number of visits per member by sk_ticket, along with their most recent attendance date.
+--For each member sk_ticket forecast the next recurring payment date based on the creation day-of-month anchor. 
+--Falls back to join date + 1 month for tickets with no recurring payments yet (new members in first cycle) and the last day of the next month to handle short months.
+mbr_tick_next_payment AS (
+    SELECT
+          l.SK_TICKET
+        , DATE_FROM_PARTS(
+            YEAR(DATEADD(MONTH, 1, COALESCE(rd.LAST_RECURR_PAY_DATE, j.JOIN_SK_DATE))),
+            MONTH(DATEADD(MONTH, 1, COALESCE(rd.LAST_RECURR_PAY_DATE, j.JOIN_SK_DATE))),
+            LEAST(
+                DAY(j.JOIN_SK_DATE),
+                DAY(LAST_DAY(DATEADD(MONTH, 1, COALESCE(rd.LAST_RECURR_PAY_DATE, j.JOIN_SK_DATE))))
+            )
+          ) AS NEXT_RECURRING_PAYMENT_DATE
+    FROM mbr_tick_last_event l
+    JOIN mbr_tick_join_event j
+        ON l.SK_TICKET = j.SK_TICKET
+    LEFT JOIN mbr_tick_recurring_dues rd
+        ON l.SK_TICKET = rd.SK_TICKET
+    JOIN GOLD_DB.DW.DIMTICKET t
+        ON l.SK_TICKET = t.SK_TICKET
+    WHERE LOWER(t.RECURRINGPAYMENTFREQUENCY) = 'monthly'
+),
+--Add actual attendance to the record. Track the total number of visits per member by sk_ticket, along with their most recent attendance date.
 mbr_tick_attendance AS (
   SELECT
       SK_TICKET
@@ -287,14 +309,18 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
     , db.BOOKINGLOCATIONSTANDARDIZED AS CONV_TYPE
     , act.LAST_EVENT AS LAST_STATUS
     , purch_dc.CUSTOMERID AS PURCH_CUSTOMER
-    , jump_dc.CUSTOMERID AS JUMPER_CUSTOMER 
+    , jump_dc.CUSTOMERID AS JUMPER_CUSTOMER
+    , a.SK_HOUSEHOLD
     , dp.PRODUCTID   AS PRODUCTID
     , dp.PRODUCTNAME AS PRODUCT_NAME
     , dp.OPERATIONSSUBGROUP AS SUB_GROUP --Changelog Daniel
     , ip.INITIAL_PAYMENT
     , rd.RECURR_AVG_DUES
     , rd.RECURR_PAY_COUNT
-    , rd.LAST_RECURR_PAY_DATE
+    , rd.LAST_RECURR_PAY_DATE AS SK_LAST_RECURR_PAY_DATE 
+    , CASE 
+        WHEN act.MBR_TICK_STATUS = 1 THEN np.NEXT_RECURRING_PAYMENT_DATE 
+      END AS SK_NEXT_RECURR_PAY_DATE
     , t.RECURRINGPAYMENTFREQUENCY AS PAY_FREQ
     , a.ATTENDANCE_DAYS
     , c.CANCEL_ACTION AS ATTRITION_REASON
@@ -337,6 +363,8 @@ LEFT JOIN mbr_tick_dim_rev dr
     ON j.BOOKINGITEMID = dr.BOOKINGITEMID
 LEFT JOIN mbr_tick_active_status act
     ON t.SK_TICKET = act.SK_TICKET
+LEFT JOIN mbr_tick_next_payment np
+    ON t.SK_TICKET = np.SK_TICKET
 LEFT JOIN mbr_tick_attendance a
     ON t.SK_TICKET = a.SK_TICKET
 LEFT JOIN GOLD_DB.DW.DIMPRODUCT dp
@@ -351,7 +379,6 @@ LEFT JOIN GOLD_DB.DW.DIMCUSTOMER purch_dc
 LEFT JOIN GOLD_DB.DW.DIMCUSTOMER jump_dc
     ON a.SK_JUMPERCUSTOMER = jump_dc.SK_CUSTOMER
 WHERE LOWER(t.RECURRINGPAYMENTFREQUENCY) = 'monthly'
-AND LOCATIONID = 'Apex, NC - 151'
 AND   LOWER(dp.operationssubgroup) NOT IN ('annual')
 AND   LOWER(dp.productname) LIKE '%member%' --Removed 358 TICKETIDs associated to products that are NOT a Membership
 AND   LOWER(dp.productname) NOT LIKE '%membership activation fee'
