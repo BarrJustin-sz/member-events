@@ -148,31 +148,28 @@ mbr_tick_cancel_logic AS (
     UNION ALL
 -- FIFTH SELECT - Identify monthly members Roller still marks active but 33+ days past their last recurring payment or join date.
 -- These are treated as lapsed and given a computed term date (last payment/join date + 33 days).
--- UAT workaround: may reflect missing cancellation events in source data rather than true lapsed memberships; filter ATTRITION_REASON = 'Lapsed' to exclude when upstream data is corrected.
+-- Bug workaround: may reflect missing cancellation events in source data rather than true lapsed memberships; filter ATTRITION_REASON = 'Lapsed' to exclude when upstream data is corrected.
         SELECT
               l.SK_TICKET
             , 'Lapsed' AS CANCEL_ACTION
             , DATEADD(DAY, 33, COALESCE(rd.LAST_RECURR_PAY_DATE, j.JOIN_SK_DATE)) AS CANCEL_DATE
         FROM mbr_tick_last_event l
-        LEFT JOIN GOLD_DB.DW.DIMTICKET t
-            ON l.SK_TICKET = t.SK_TICKET
         LEFT JOIN mbr_tick_recurring_dues rd
             ON l.SK_TICKET = rd.SK_TICKET
         LEFT JOIN mbr_tick_join_event j
             ON l.SK_TICKET = j.SK_TICKET
         WHERE l.MBR_TICK_STATUS = 1
-            AND LOWER(t.RECURRINGPAYMENTFREQUENCY) = 'monthly'
             AND CURRENT_DATE >= DATEADD(DAY, 33, COALESCE(rd.LAST_RECURR_PAY_DATE, j.JOIN_SK_DATE))
 ),
---Secondary CTE for saftey to ensure only one cancel event is captured per member sk_ticket in the previous union CTE. No cases were found where multiple cancel events existed. 
---If multiple cancel events do exist for the same member sk_ticket, this logic will keep the most recent cancel event.
+--Secondary CTE for safety to ensure only one cancel event is captured per member sk_ticket.
+--Orders by non-Lapsed first so a real cancel event always returns over a computed lapsed date, then by most recent cancel date.
 mbr_tick_cancel_event AS (
-  SELECT 
+  SELECT
     *
   FROM mbr_tick_cancel_logic
   QUALIFY ROW_NUMBER() OVER (
     PARTITION BY SK_TICKET
-    ORDER BY CANCEL_DATE DESC
+    ORDER BY CASE WHEN CANCEL_ACTION = 'Lapsed' THEN 1 ELSE 0 END ASC, CANCEL_DATE DESC
   ) = 1
 ),
 --For each member sk_ticket, identify the last event where rn = 1 and the event is 'Cancelled', 'Assumed Cancel', or 'Default Cancelled'.
@@ -183,7 +180,7 @@ mbr_tick_term_event AS (
     FROM mbr_tick_events
     WHERE rn = 1
         AND EVENTTYPE IN ('Cancelled', 'Assumed Cancelled', 'Default Cancelled')
-    --UAT workaround: Roller sometimes records a same-day 'Pending Cancellation' with a later timestamp than the actual cancellation event,
+    --Bug workaround: Roller sometimes records a same-day 'Pending Cancellation' with a later timestamp than the actual cancellation event,
     --causing 'Pending Cancellation' to sort to rn = 1 and burying the cancellation at rn = 2 (e.g. tickets 5332521-11704773, 59259862-218388652).
     --When rn = 1 is 'Pending Cancellation' and rn = 2 is a cancellation event on the same date, promote rn = 2 as the term date.
     UNION ALL
@@ -374,7 +371,7 @@ LEFT JOIN GOLD_DB.DW.DIMLOCATION dl
     ON dr.SK_LOCATION = dl.SK_LOCATION
 LEFT JOIN GOLD_DB.DW.DIMBOOKING db
     ON dr.SK_BOOKING = db.SK_BOOKING
--- FactRev sometimes has null sk_customer, so attendance is used as a backup to join to the customer dimension. ONCE THIS BUG IS SOLVED WE CAN REMOVE THE COLAESCE CLAUSE
+-- Bug workaround: FactRev sometimes has null sk_customer, so attendance is used as a backup to join to the customer dimension.
 LEFT JOIN GOLD_DB.DW.DIMCUSTOMER purch_dc
     ON COALESCE(NULLIF(dr.SK_CUSTOMER, -1), a.SK_PURCHASINGCUSTOMER) = purch_dc.SK_CUSTOMER 
 LEFT JOIN GOLD_DB.DW.DIMCUSTOMER jump_dc
