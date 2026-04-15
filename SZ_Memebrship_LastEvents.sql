@@ -1,6 +1,5 @@
--- Sort member events in descending order (newest first), where rn = 1 represents the most recent event.
--- Also tracks the last recurring payment and last upgrade date per ticket to support cancel-always-wins logic.
 WITH
+--Sort member events in descending order (newest first). Use this to identify member actioned cancellation events that occurred prior to termination. 
 mbr_tick_events AS (
     SELECT
           fm.SK_TICKET
@@ -9,6 +8,7 @@ mbr_tick_events AS (
         , dm.EVENTTYPE
         , fm.SK_DATE
         , fm.SK_TIME
+        , TIMESTAMP_NTZ_FROM_PARTS(fm.SK_DATE, fm.SK_TIME) AS SK_DATETIME
         , fm.VALUE
         , fm.FLAG_REFUNDED
         , dm.ACTIVE
@@ -19,16 +19,49 @@ mbr_tick_events AS (
         , MAX(CASE WHEN dm.EVENTTYPE IN ('Upgraded From Active', 'Upgraded From Inactive')
                    THEN fm.SK_DATE END)
               OVER (PARTITION BY fm.SK_TICKET) AS LAST_UPGRADE_DATE
-        , ROW_NUMBER() OVER (
-            PARTITION BY fm.SK_TICKET
-            ORDER BY fm.SK_DATE DESC, fm.SK_TIME DESC, dm.SORTORDER2 DESC
-        ) AS rn
     FROM GOLD_DB.DW.FACTMEMBERSHIPPASSEVENTS fm
     JOIN GOLD_DB.DW.DIMMEMBERSHIPPASSEVENT dm
         USING(SK_EVENTTYPE)
 ),
---For each member sk_ticket, get the most recent effective event per ticket. A Cancelled event wins as the last event when no Recurring Payment
---or Upgrade has occurred after it (meaning the member never genuinely came back after cancelling).
+--Bug workaround: Filter out events that occurred after the effective cancel (cancel with no subsequent recurring payment or upgrade).
+--Tickets with no effective cancel pass through unchanged based on 'EFFECTIVE_CANCEL_DATETIME IS NULL'
+mbr_tick_events_subset AS (
+    SELECT *
+    FROM (
+        SELECT
+              *
+            , MAX(CASE
+                    WHEN EVENTTYPE IN ('Cancelled', 'Assumed Cancelled', 'Default Cancelled')
+                     AND (LAST_RECURR_PAY_DATE IS NULL OR LAST_RECURR_PAY_DATE < SK_DATE)
+                     AND (LAST_UPGRADE_DATE IS NULL OR LAST_UPGRADE_DATE < SK_DATE)
+                    THEN SK_DATETIME
+                  END) OVER (PARTITION BY SK_TICKET) AS EFFECTIVE_CANCEL_DATETIME
+        FROM mbr_tick_events
+    )
+    WHERE EFFECTIVE_CANCEL_DATETIME IS NULL
+       OR SK_DATETIME <= EFFECTIVE_CANCEL_DATETIME
+),
+--Bug workaround: Cleaned member sk_ticket events excluding events that occurred after effective cancel. All other CTEs use this clean view for rn-based lookups.
+mbr_tick_events_clean AS (
+    SELECT
+          SK_TICKET
+        , BOOKINGITEMID
+        , SK_EVENTTYPE
+        , EVENTTYPE
+        , SK_DATE
+        , SK_TIME
+        , SK_DATETIME
+        , VALUE
+        , FLAG_REFUNDED
+        , ACTIVE
+        , SORTORDER2
+        , ROW_NUMBER() OVER (
+            PARTITION BY SK_TICKET
+            ORDER BY SK_DATETIME DESC, SORTORDER2 DESC
+          ) AS rn
+    FROM mbr_tick_events_subset
+),
+--For each member sk_ticket, retain only the most recent effective event (rn = 1).
 mbr_tick_last_event AS (
     SELECT
           SK_TICKET
@@ -36,87 +69,53 @@ mbr_tick_last_event AS (
         , SK_EVENTTYPE AS LAST_SK_EVENT
         , EVENTTYPE AS LAST_EVENT
         , SK_DATE AS LAST_SK_DATE
-    FROM mbr_tick_events
-    QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY SK_TICKET
-        ORDER BY
-            CASE
-                WHEN EVENTTYPE IN ('Cancelled', 'Assumed Cancelled', 'Default Cancelled')
-                 AND (LAST_RECURR_PAY_DATE IS NULL OR LAST_RECURR_PAY_DATE < SK_DATE)
-                 AND (LAST_UPGRADE_DATE IS NULL OR LAST_UPGRADE_DATE < SK_DATE)
-                THEN 0
-                ELSE 1
-            END ASC,
-            SK_DATE DESC, SK_TIME DESC, SORTORDER2 DESC
-    ) = 1
+    FROM mbr_tick_events_clean
+    WHERE rn = 1
 ),
---For each member sk_ticket, get the most recent Cancelled event per ticket where no Recurring Payment or Upgrade occurred after it.
---Used to find the event before the cancel for CANCEL_ACTION label inspection.
-mbr_tick_last_cancel AS (
-    SELECT
-          SK_TICKET
-        , SK_DATE AS LAST_CANCEL_DATE
-        , SK_TIME AS LAST_CANCEL_TIME
-    FROM mbr_tick_events
-    WHERE EVENTTYPE IN ('Cancelled', 'Assumed Cancelled', 'Default Cancelled')
-      AND (LAST_RECURR_PAY_DATE IS NULL OR LAST_RECURR_PAY_DATE < SK_DATE)
-      AND (LAST_UPGRADE_DATE IS NULL OR LAST_UPGRADE_DATE < SK_DATE)
-    QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY SK_TICKET
-        ORDER BY SK_DATE DESC, SK_TIME DESC
-    ) = 1
-),
--- Event immediately preceding the most recent qualifying Cancelled event per ticket.
--- Used to derive CANCEL_ACTION label (what drove the cancellation).
+--For each member sk_ticket, capture the event immediately preceding the most recent effective event (where rn = 2).
 mbr_tick_prev_event AS (
-    SELECT
-          e.SK_TICKET
-        , e.ACTIVE AS MBR_TICK_STATUS
-        , e.SK_EVENTTYPE AS PREV_SK_EVENT
-        , e.EVENTTYPE AS PREV_EVENT
-        , e.SK_DATE AS PREV_SK_DATE
-    FROM mbr_tick_events e
-    JOIN mbr_tick_last_cancel lc ON e.SK_TICKET = lc.SK_TICKET
-    WHERE e.SK_DATE < lc.LAST_CANCEL_DATE
-       OR (e.SK_DATE = lc.LAST_CANCEL_DATE AND e.SK_TIME < lc.LAST_CANCEL_TIME)
-    QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY e.SK_TICKET
-        ORDER BY e.SK_DATE DESC, e.SK_TIME DESC
-    ) = 1
+    SELECT 
+          SK_TICKET
+        , ACTIVE AS MBR_TICK_STATUS
+        , SK_EVENTTYPE AS PREV_SK_EVENT 
+        , EVENTTYPE AS PREV_EVENT
+        , SK_DATE AS PREV_SK_DATE
+    FROM mbr_tick_events_clean
+    WHERE rn = 2 
 ),
---For each member sk_ticket, identify the create date as the join date.
+--For each member sk_ticket, identify the create date as the join date. Use Qualify to guarantee there are not multiple joins.
 mbr_tick_join_event AS (
     SELECT
           SK_TICKET
         , BOOKINGITEMID
         , SK_DATE AS JOIN_SK_DATE
-    FROM mbr_tick_events
-    WHERE EVENTTYPE = 'Creation' 
+    FROM mbr_tick_events_clean
+    WHERE EVENTTYPE = 'Creation'
     QUALIFY ROW_NUMBER() OVER (
         PARTITION BY SK_TICKET
-        ORDER BY SK_DATE ASC, SK_TIME ASC
+        ORDER BY SK_DATETIME ASC
     ) = 1
 ),
---For each member sk_ticket, identify the inital payment dues. Use Qualify to guarantee there are not multiple initial payments. Creation and initial payment occur at the same time so it doesnt matter which event we pull. 
+--For each member sk_ticket, identify the inital payment dues. Use Qualify to guarantee there are not multiple initial payments. Creation and initial payment occur at the same time so it doesnt matter which event we pull.
 mbr_tick_initial_pay AS (
     SELECT
           SK_TICKET
         , ROUND(VALUE, 2) AS INITIAL_PAYMENT
-    FROM mbr_tick_events
+    FROM mbr_tick_events_clean
     WHERE EVENTTYPE = 'Initial Payment'
     QUALIFY ROW_NUMBER() OVER (
         PARTITION BY SK_TICKET
-        ORDER BY SK_DATE ASC, SK_TIME ASC
+        ORDER BY SK_DATETIME ASC
     ) = 1
 ),
 --For each member sk_ticket, identify average recurring payment dues.
 mbr_tick_recurring_dues AS (
-    SELECT 
-          SK_TICKET 
+    SELECT
+          SK_TICKET
         , COUNT(DISTINCT DATE(SK_DATE)) AS RECURR_PAY_COUNT
         , ROUND(AVG(VALUE), 2) AS RECURR_AVG_DUES
         , MAX(SK_DATE) AS LAST_RECURR_PAY_DATE
-    FROM mbr_tick_events
+    FROM mbr_tick_events_clean
     WHERE EVENTTYPE = 'Recurring Payment'
     GROUP BY SK_TICKET
 ),
@@ -126,17 +125,17 @@ mbr_tick_upgrade_event AS (
     SELECT
           SK_TICKET
         , SK_DATE AS UPGRADE_DATE
-    FROM mbr_tick_events
+    FROM mbr_tick_events_clean
     WHERE rn = 1
         AND EVENTTYPE IN ('Upgraded From Active', 'Upgraded From Inactive')
 ),
---For each member sk_ticket, find the max refund request date and number of times a member has requested a refund 
+--For each member sk_ticket, find the max refund request date and number of times a member has requested a refund
 mbr_tick_refund_event AS (
     SELECT
           SK_TICKET
         , MAX(SK_DATE) AS MAX_REFUND_SK_DATE
         , COUNT(DISTINCT SK_DATE) AS REFUND_REQUESTS
-    FROM mbr_tick_events
+    FROM mbr_tick_events_clean
     WHERE EVENTTYPE = 'Refund'
     GROUP BY SK_TICKET
 ),
@@ -169,7 +168,7 @@ mbr_tick_cancel_logic AS (
                 WHEN (p.MBR_TICK_STATUS = 0 OR p.PREV_EVENT = 'Pending Cancellation') THEN
                     CASE
                         WHEN p.PREV_EVENT = 'Pending Cancellation' THEN 'Cancel Requested'
-                        WHEN p.PREV_EVENT IN ('Assumed Cancelled', 'Cancelled') THEN 'Cancelled'
+                        WHEN p.PREV_EVENT = 'Assumed Cancelled' THEN 'Cancel Assumed'
                         WHEN p.PREV_EVENT IN ('Declined Payment', 'Missed Payment', 'Assumed Tokenization Issue') THEN 'Payment Issue'
                         WHEN p.PREV_EVENT = 'Refund' THEN 'Refund'
                         ELSE 'Cancelled'
@@ -216,29 +215,14 @@ mbr_tick_cancel_event AS (
     ORDER BY CASE WHEN CANCEL_ACTION = 'Lapsed' THEN 1 ELSE 0 END ASC, CANCEL_DATE DESC
   ) = 1
 ),
---For each member sk_ticket, identify the last event where rn = 1 and the event is 'Cancelled', 'Assumed Cancel', or 'Default Cancelled'.
+--For each member sk_ticket, identify the cancellation date as the term date.
+--Uses mbr_tick_last_event which already accounts for cancel-always-wins logic and the Pending Cancellation sort bug.
 mbr_tick_term_event AS (
     SELECT
           SK_TICKET
-        , SK_DATE AS TERM_SK_DATE
-    FROM mbr_tick_events
-    WHERE rn = 1
-        AND EVENTTYPE IN ('Cancelled', 'Assumed Cancelled', 'Default Cancelled')
-    --Bug workaround: Roller sometimes records a same-day 'Pending Cancellation' with a later timestamp than the actual cancellation event,
-    --causing 'Pending Cancellation' to sort to rn = 1 and burying the cancellation at rn = 2 (e.g. tickets 5332521-11704773, 59259862-218388652).
-    --When rn = 1 is 'Pending Cancellation' and rn = 2 is a cancellation event on the same date, promote rn = 2 as the term date.
-    UNION ALL
-    SELECT
-          e2.SK_TICKET
-        , e2.SK_DATE AS TERM_SK_DATE
-    FROM mbr_tick_events e1
-    JOIN mbr_tick_events e2
-        ON e1.SK_TICKET = e2.SK_TICKET
-        AND e1.SK_DATE = e2.SK_DATE
-    WHERE e1.rn = 1
-        AND e1.EVENTTYPE = 'Pending Cancellation'
-        AND e2.rn = 2
-        AND e2.EVENTTYPE IN ('Cancelled', 'Assumed Cancelled', 'Default Cancelled')
+        , LAST_SK_DATE AS TERM_SK_DATE
+    FROM mbr_tick_last_event
+    WHERE LAST_EVENT IN ('Cancelled', 'Assumed Cancelled', 'Default Cancelled')
 ),
 --For each member sk_ticket, identify if they are still active in Roller (active = 1; terminated = 0). If the member is still active then the status is 1 and term_date is null.
 mbr_tick_active_status AS (
@@ -326,6 +310,7 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
       dr.SK_LOCATION
     , dr.SK_PRODUCT
     , dr.SK_BOOKING
+    , t.sk_ticket
     , dr.SK_BOOKINGCREATEDBYEMPLOYEE
     , dr.SK_PAYMENTTAKENBYEMPLOYEE
     , j.JOIN_SK_DATE AS JOIN_DATE
@@ -424,5 +409,7 @@ WHERE LOWER(t.RECURRINGPAYMENTFREQUENCY) = 'monthly'
 AND   LOWER(dp.operationssubgroup) NOT IN ('annual')
 AND   LOWER(dp.productname) LIKE '%member%' --Removed 358 TICKETIDs associated to products that are NOT a Membership
 AND   LOWER(dp.productname) NOT LIKE '%membership activation fee'
+AND   dl.LOCATIONID = 'Aurora, CO - 130'
+AND TICKETID = '89595290-317388691'
 ORDER BY j.JOIN_SK_DATE DESC, dl.LOCATIONID ASC
 ;
