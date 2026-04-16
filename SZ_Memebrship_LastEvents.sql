@@ -329,17 +329,14 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
     , a.LAST_CHECKIN AS LAST_CHECKIN
     , u.UPGRADE_DATE AS UPGRADE_DATE
     --BUG FIX: CANCEL_DATE from cancel logic may be null for roller-terminated members missing a cancel event; fall back to roller status date.
-    , COALESCE(c.CANCEL_DATE, CASE WHEN rs.ROLLER_STATUS = 'Terminated' THEN rs.ROLLER_STATUS_DATE END) AS ATTRITION_DATE
+    , COALESCE(c.CANCEL_DATE, CASE WHEN rs.ROLLER_STATUS IN ('Terminated', 'Upgraded') THEN rs.ROLLER_STATUS_DATE END) AS ATTRITION_DATE
     , r.MAX_REFUND_SK_DATE AS LAST_REFUND_DATE
     --If a member ticket has a payment issue, refund, or upgrade the account is closed so use the cancel date from the cancel event table. 
     --If there is no payment issue but there is a cancel date from the term event table, then use that date. If there is no cancellation, then term_date is null.
     , CASE
-        WHEN c.CANCEL_ACTION = 'Payment Issue' THEN c.CANCEL_DATE
-        WHEN c.CANCEL_ACTION = 'Refund' THEN c.CANCEL_DATE
-        WHEN c.CANCEL_ACTION = 'Upgraded' THEN c.CANCEL_DATE
-        WHEN c.CANCEL_ACTION = 'Lapsed' THEN c.CANCEL_DATE
-        --BUG FIX: Override the termination date due to the known recurring payment bug if the last Roller status is 'Terminated'     
-        WHEN rs.ROLLER_STATUS = 'Terminated' THEN rs.ROLLER_STATUS_DATE
+        WHEN c.CANCEL_ACTION IN ('Payment Issue', 'Refund', 'Upgraded', 'Lapsed') THEN c.CANCEL_DATE
+        --BUG FIX: Override the termination date due to the known recurring payment bug if the last Roller status is 'Terminated' or 'Upgraded'
+        WHEN rs.ROLLER_STATUS IN ('Terminated', 'Upgraded') THEN rs.ROLLER_STATUS_DATE
         ELSE tm.TERM_SK_DATE
       END AS TERMINATION_DATE
     , dl.BUSINESSGROUP AS BUSINESS_GROUP
@@ -366,16 +363,17 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
         WHEN c.CANCEL_ACTION IS NULL THEN np.NEXT_RECURRING_PAYMENT_DATE
       END AS NEXT_RECURR_PAY_DATE
     , a.ATTENDANCE_DAYS
-    --BUG FIX: Override the attrition reason due to the known recurring payment bug if the last Roller status is 'Terminated'    
+    --BUG FIX: Override the attrition reason due to the known recurring payment bug if the last Roller status is 'Terminated' or 'Upgraded'
     , CASE
         WHEN c.CANCEL_ACTION IS NOT NULL THEN c.CANCEL_ACTION
         WHEN rs.ROLLER_STATUS = 'Terminated' THEN 'Term Roller'
+        WHEN rs.ROLLER_STATUS = 'Upgraded' THEN 'Upgraded'
         ELSE NULL
       END AS ATTRITION_REASON
     --The number of days between join and cancellation used for attrition and retention analysis. If there is no cancellation, then this value is null.
-    --BUG FIX: ATTRITION_DAYS was null for roller-terminated members missing a cancel event; use roller status date as fallback attrition anchor.
+    --BUG FIX: ATTRITION_DAYS was null for roller-terminated/upgraded members missing a cancel event; use roller status date as fallback attrition anchor.
     , CASE
-        WHEN c.CANCEL_DATE IS NULL AND NOT (rs.ROLLER_STATUS = 'Terminated') THEN NULL
+        WHEN c.CANCEL_DATE IS NULL AND NOT (rs.ROLLER_STATUS IN ('Terminated', 'Upgraded')) THEN NULL
         ELSE GREATEST(
             0,
             DATEDIFF(
@@ -391,13 +389,13 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
     --BUG FIX: Members terminated in Roller without a matching cancel event would incorrectly show as retained; treat Roller 'Terminated' as inactive.
     , CASE
         WHEN c.CANCEL_ACTION IS NOT NULL THEN 0
-        WHEN rs.ROLLER_STATUS = 'Terminated' THEN 0
+        WHEN rs.ROLLER_STATUS IN ('Terminated', 'Upgraded') THEN 0
         ELSE 1
       END AS PROJ_RETENTION_STATUS
-    --BUG FIX: act.MBR_TICK_STATUS is derived from FACTMEMBERSHIPPASSEVENTS which may be missing termination events; use Roller status as override.
+    --BUG FIX: act.MBR_TICK_STATUS is derived from FACTMEMBERSHIPPASSEVENTS which may be missing termination/upgrade events; use Roller status as override.
     , CASE
         WHEN act.MBR_TICK_STATUS = 0 THEN 0
-        WHEN rs.ROLLER_STATUS = 'Terminated' THEN 0
+        WHEN rs.ROLLER_STATUS IN ('Terminated', 'Upgraded') THEN 0
         ELSE act.MBR_TICK_STATUS
       END AS ACTIVE_STATUS
 FROM GOLD_DB.DW.DIMTICKET t
