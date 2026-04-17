@@ -349,9 +349,9 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
     , t.CUSTOMTICKETID
     , j.BOOKINGITEMID
     , db.BOOKINGLOCATIONSTANDARDIZED AS CONV_TYPE
-    , act.LAST_EVENT AS LAST_STATUS
-    --Bug Fix: Included to override the FACTMEMBERSHIPPASSEVENTS status / active issues   
-    , rs.ROLLER_STATUS
+    , act.LAST_EVENT AS STATUS_LAST
+    --Bug Fix: Included to override the FACTMEMBERSHIPPASSEVENTS status / active issues
+    , rs.ROLLER_STATUS AS STATUS_ROLLER
     , purch_dc.CUSTOMERID AS CUSTOMER_PURCHASE
     , jump_dc.CUSTOMERID AS CUSTOMER_JUMPER
     , dp.PRODUCTNAME AS PRODUCT_NAME
