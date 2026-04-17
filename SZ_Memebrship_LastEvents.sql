@@ -1,5 +1,6 @@
 WITH
 --Sort member events in descending order (newest first). Use this to identify member actioned cancellation events that occurred prior to termination. 
+--BUG FIX: Added MAX recurring and upgraded date to account for recurring payments bug 
 mbr_tick_events AS (
     SELECT
           fm.SK_TICKET
@@ -100,7 +101,7 @@ mbr_tick_join_event AS (
 mbr_tick_initial_pay AS (
     SELECT
           SK_TICKET
-        , ROUND(VALUE, 2) AS INITIAL_PAYMENT
+        , ROUND(VALUE, 2) AS PAY_INITIAL
     FROM mbr_tick_events_clean
     WHERE EVENTTYPE = 'Initial Payment'
     QUALIFY ROW_NUMBER() OVER (
@@ -134,7 +135,7 @@ mbr_tick_refund_event AS (
     SELECT
           SK_TICKET
         , MAX(SK_DATE) AS MAX_REFUND_SK_DATE
-        , COUNT(DISTINCT SK_DATE) AS REFUND_REQUESTS
+        , COUNT(DISTINCT SK_DATE) AS REFUND_COUNT
     FROM mbr_tick_events_clean
     WHERE EVENTTYPE = 'Refund'
     GROUP BY SK_TICKET
@@ -191,7 +192,7 @@ mbr_tick_cancel_logic AS (
     UNION ALL
 -- FIFTH SELECT - Identify monthly members Roller still marks active but 33+ days past their last recurring payment or join date.
 -- These are treated as lapsed and given a computed term date (last payment/join date + 33 days).
--- BUG FIX: may reflect missing cancellation events in source data rather than true lapsed memberships; filter ATTRITION_REASON = 'Lapsed' to exclude when upstream data is corrected.
+-- BUG FIX: may reflect missing cancellation events in source data rather than true lapsed memberships; filter CHURN_REASON = 'Lapsed' to exclude when upstream data is corrected.
         SELECT
               l.SK_TICKET
             , 'Lapsed' AS CANCEL_ACTION
@@ -299,7 +300,7 @@ mbr_tick_attendance AS (
     , SK_HOUSEHOLD
     , SK_DATE_CHECKIN AS LAST_CHECKIN                                
     , COUNT(DISTINCT SK_DATE_CHECKIN)
-        OVER (PARTITION BY SK_TICKET) AS ATTENDANCE_DAYS
+        OVER (PARTITION BY SK_TICKET) AS CHECKIN_COUNT
   FROM GOLD_DB.DW.FACTATTENDANCE
   QUALIFY ROW_NUMBER() OVER (
     PARTITION BY SK_TICKET
@@ -322,23 +323,25 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
       dr.SK_LOCATION
     , dr.SK_PRODUCT
     , dr.SK_BOOKING
-    , t.sk_ticket
+    , t.SK_TICKET
     , dr.SK_BOOKINGCREATEDBYEMPLOYEE
-    , dr.SK_PAYMENTTAKENBYEMPLOYEE
-    , j.JOIN_SK_DATE AS JOIN_DATE
-    , a.LAST_CHECKIN AS LAST_CHECKIN
-    , u.UPGRADE_DATE AS UPGRADE_DATE
+    , a.SK_HOUSEHOLD
+    , a.SK_PURCHASINGCUSTOMER
+    , a.SK_JUMPERCUSTOMER
+    , j.JOIN_SK_DATE AS DATE_JOIN
+    , a.LAST_CHECKIN AS DATE_LAST_CHECKIN
+    , u.UPGRADE_DATE AS DATE_UPGRADE
     --BUG FIX: CANCEL_DATE from cancel logic may be null for roller-terminated members missing a cancel event; fall back to roller status date.
-    , COALESCE(c.CANCEL_DATE, CASE WHEN rs.ROLLER_STATUS IN ('Terminated', 'Upgraded') THEN rs.ROLLER_STATUS_DATE END) AS ATTRITION_DATE
-    , r.MAX_REFUND_SK_DATE AS LAST_REFUND_DATE
+    , r.MAX_REFUND_SK_DATE AS DATE_LAST_REFUND
     --If a member ticket has a payment issue, refund, or upgrade the account is closed so use the cancel date from the cancel event table. 
     --If there is no payment issue but there is a cancel date from the term event table, then use that date. If there is no cancellation, then term_date is null.
+    , COALESCE(c.CANCEL_DATE, CASE WHEN rs.ROLLER_STATUS IN ('Terminated', 'Upgraded') THEN rs.ROLLER_STATUS_DATE END) AS DATE_CHURN
     , CASE
         WHEN c.CANCEL_ACTION IN ('Payment Issue', 'Refund', 'Upgraded', 'Lapsed') THEN c.CANCEL_DATE
         --BUG FIX: Override the termination date due to the known recurring payment bug if the last Roller status is 'Terminated' or 'Upgraded'
         WHEN rs.ROLLER_STATUS IN ('Terminated', 'Upgraded') THEN rs.ROLLER_STATUS_DATE
         ELSE tm.TERM_SK_DATE
-      END AS TERMINATION_DATE
+      END AS DATE_TERMINATION
     , dl.BUSINESSGROUP AS BUSINESS_GROUP
     , dl.LOCATIONID
     , t.TICKETID
@@ -347,31 +350,31 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
     , j.BOOKINGITEMID
     , db.BOOKINGLOCATIONSTANDARDIZED AS CONV_TYPE
     , act.LAST_EVENT AS LAST_STATUS
+    --Bug Fix: Included to override the FACTMEMBERSHIPPASSEVENTS status / active issues   
     , rs.ROLLER_STATUS
-    , purch_dc.CUSTOMERID AS PURCH_CUSTOMER
-    , jump_dc.CUSTOMERID AS JUMPER_CUSTOMER
-    , a.SK_HOUSEHOLD
-    , dp.PRODUCTID   AS PRODUCTID
+    , purch_dc.CUSTOMERID AS CUSTOMER_PURCHASE
+    , jump_dc.CUSTOMERID AS CUSTOMER_JUMPER
     , dp.PRODUCTNAME AS PRODUCT_NAME
-    , dp.OPERATIONSSUBGROUP AS SUB_GROUP 
+    --, dp.OPERATIONSSUBGROUP AS SUB_GROUP 
+    , a.CHECKIN_COUNT
     , t.RECURRINGPAYMENTFREQUENCY AS PAY_FREQ
-    , ip.INITIAL_PAYMENT
+    , ip.PAY_INITIAL
     , rd.RECURR_AVG_DUES
     , rd.RECURR_PAY_COUNT
-    , rd.LAST_RECURR_PAY_DATE AS LAST_RECURR_PAY_DATE 
+    , rd.LAST_RECURR_PAY_DATE AS RECURR_LAST_PAY_DATE 
     , CASE
         WHEN c.CANCEL_ACTION IS NULL THEN np.NEXT_RECURRING_PAYMENT_DATE
-      END AS NEXT_RECURR_PAY_DATE
-    , a.ATTENDANCE_DAYS
-    --BUG FIX: Override the attrition reason due to the known recurring payment bug if the last Roller status is 'Terminated' or 'Upgraded'
+      END AS RECURR_NEXT_PAY_DATE
+    , r.REFUND_COUNT
+    --BUG FIX: Override the churn reason due to the known recurring payment bug if the last Roller status is 'Terminated' or 'Upgraded'
     , CASE
         WHEN c.CANCEL_ACTION IS NOT NULL THEN c.CANCEL_ACTION
         WHEN rs.ROLLER_STATUS = 'Terminated' THEN 'Term Roller'
         WHEN rs.ROLLER_STATUS = 'Upgraded' THEN 'Upgraded'
         ELSE NULL
-      END AS ATTRITION_REASON
-    --The number of days between join and cancellation used for attrition and retention analysis. If there is no cancellation, then this value is null.
-    --BUG FIX: ATTRITION_DAYS was null for roller-terminated/upgraded members missing a cancel event; use roller status date as fallback attrition anchor.
+      END AS CHURN_REASON
+    --The number of days between join and cancellation used for churn and retention analysis. If there is no cancellation, then this value is null.
+    --BUG FIX: CHURN_DAYS was null for roller-terminated/upgraded members missing a cancel event; use roller status date as fallback churn anchor.
     , CASE
         WHEN c.CANCEL_DATE IS NULL AND NOT (rs.ROLLER_STATUS IN ('Terminated', 'Upgraded')) THEN NULL
         ELSE GREATEST(
@@ -382,22 +385,21 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
                 TO_DATE(COALESCE(c.CANCEL_DATE, rs.ROLLER_STATUS_DATE))
             )
         )
-      END AS ATTRITION_DAYS
-    , r.REFUND_REQUESTS
+      END AS CHURN_DAYS
     --Override the member ticket active status if the ticket has a cancel, term, or upgrade event to indicate the member is no longer active. 1 = active; 0 = inactive. 
-    --This metric is for future use to forecast coming attrition and potentially use to provide benefits to keep the member active.
+    --This metric is for future use to forecast coming churn and potentially use to provide benefits to keep the member active.
     --BUG FIX: Members terminated in Roller without a matching cancel event would incorrectly show as retained; treat Roller 'Terminated' as inactive.
     , CASE
         WHEN c.CANCEL_ACTION IS NOT NULL THEN 0
         WHEN rs.ROLLER_STATUS IN ('Terminated', 'Upgraded') THEN 0
         ELSE 1
-      END AS PROJ_RETENTION_STATUS
+      END AS STATUS_PROJ
     --BUG FIX: act.MBR_TICK_STATUS is derived from FACTMEMBERSHIPPASSEVENTS which may be missing termination/upgrade events; use Roller status as override.
     , CASE
         WHEN act.MBR_TICK_STATUS = 0 THEN 0
         WHEN rs.ROLLER_STATUS IN ('Terminated', 'Upgraded') THEN 0
         ELSE act.MBR_TICK_STATUS
-      END AS ACTIVE_STATUS
+      END AS STATUS_ACTIVE
 FROM GOLD_DB.DW.DIMTICKET t
 INNER JOIN mbr_tick_join_event j  
     ON t.SK_TICKET = j.SK_TICKET
@@ -427,7 +429,7 @@ LEFT JOIN GOLD_DB.DW.DIMLOCATION dl
     ON dr.SK_LOCATION = dl.SK_LOCATION
 LEFT JOIN GOLD_DB.DW.DIMBOOKING db
     ON dr.SK_BOOKING = db.SK_BOOKING
--- BUG FIX: FactRev sometimes has null sk_customer, so attendance is used as a backup to join to the customer dimension.
+--BUG FIX: FactRev sometimes has null sk_customer, so attendance is used as a backup to join to the customer dimension.
 LEFT JOIN GOLD_DB.DW.DIMCUSTOMER purch_dc
     ON COALESCE(NULLIF(dr.SK_CUSTOMER, -1), a.SK_PURCHASINGCUSTOMER) = purch_dc.SK_CUSTOMER 
 --BUG FIX: FACTMEMBERSHIPPASSEVENTS doesnt accurately capture the last status; using Roller silver layer bridge to get the last status
