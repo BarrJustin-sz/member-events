@@ -192,7 +192,7 @@ mbr_tick_cancel_logic AS (
     UNION ALL
 -- FIFTH SELECT - Identify monthly members Roller still marks active but 33+ days past their last recurring payment or join date.
 -- These are treated as lapsed and given a computed term date (last payment/join date + 33 days).
--- BUG FIX: may reflect missing cancellation events in source data rather than true lapsed memberships; filter CHURN_REASON = 'Lapsed' to exclude when upstream data is corrected.
+-- BUG FIX: may reflect missing cancellation events in source data rather than true lapsed memberships; filter CANCEL_REASON = 'Lapsed' to exclude when upstream data is corrected.
         SELECT
               l.SK_TICKET
             , 'Lapsed' AS CANCEL_ACTION
@@ -335,7 +335,7 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
     , r.MAX_REFUND_SK_DATE AS DATE_LAST_REFUND
     --If a member ticket has a payment issue, refund, or upgrade the account is closed so use the cancel date from the cancel event table. 
     --If there is no payment issue but there is a cancel date from the term event table, then use that date. If there is no cancellation, then term_date is null.
-    , COALESCE(c.CANCEL_DATE, CASE WHEN rs.ROLLER_STATUS IN ('Terminated', 'Upgraded') THEN rs.ROLLER_STATUS_DATE END) AS DATE_CHURN
+    , COALESCE(c.CANCEL_DATE, CASE WHEN rs.ROLLER_STATUS IN ('Terminated', 'Upgraded') THEN rs.ROLLER_STATUS_DATE END) AS DATE_CANCEL
     , CASE
         WHEN c.CANCEL_ACTION IN ('Payment Issue', 'Refund', 'Upgraded', 'Lapsed') THEN c.CANCEL_DATE
         --BUG FIX: Override the termination date due to the known recurring payment bug if the last Roller status is 'Terminated' or 'Upgraded'
@@ -366,15 +366,15 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
         WHEN c.CANCEL_ACTION IS NULL THEN np.NEXT_RECURRING_PAYMENT_DATE
       END AS RECURR_NEXT_PAY_DATE
     , r.REFUND_COUNT
-    --BUG FIX: Override the churn reason due to the known recurring payment bug if the last Roller status is 'Terminated' or 'Upgraded'
+    --BUG FIX: Override the cancel reason due to the known recurring payment bug if the last Roller status is 'Terminated' or 'Upgraded'
     , CASE
         WHEN c.CANCEL_ACTION IS NOT NULL THEN c.CANCEL_ACTION
         WHEN rs.ROLLER_STATUS = 'Terminated' THEN 'Term Roller'
         WHEN rs.ROLLER_STATUS = 'Upgraded' THEN 'Upgraded'
         ELSE NULL
-      END AS CHURN_REASON
-    --The number of days between join and cancellation used for churn and retention analysis. If there is no cancellation, then this value is null.
-    --BUG FIX: CHURN_DAYS was null for roller-terminated/upgraded members missing a cancel event; use roller status date as fallback churn anchor.
+      END AS CANCEL_REASON
+    --The number of days between join and cancellation used for cancel and retention analysis. If there is no cancellation, then this value is null.
+    --BUG FIX: CANCEL_DAYS was null for roller-terminated/upgraded members missing a cancel event; use roller status date as fallback cancel anchor.
     , CASE
         WHEN c.CANCEL_DATE IS NULL AND NOT (rs.ROLLER_STATUS IN ('Terminated', 'Upgraded')) THEN NULL
         ELSE GREATEST(
@@ -385,7 +385,7 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
                 TO_DATE(COALESCE(c.CANCEL_DATE, rs.ROLLER_STATUS_DATE))
             )
         )
-      END AS CHURN_DAYS
+      END AS CANCEL_DAYS
     --Override the member ticket active status if the ticket has a cancel, term, or upgrade event to indicate the member is no longer active. 1 = active; 0 = inactive. 
     --This metric is for future use to forecast coming churn and potentially use to provide benefits to keep the member active.
     --BUG FIX: Members terminated in Roller without a matching cancel event would incorrectly show as retained; treat Roller 'Terminated' as inactive.
