@@ -109,16 +109,22 @@ mbr_tick_initial_pay AS (
         ORDER BY SK_DATETIME ASC
     ) = 1
 ),
---For each member sk_ticket, identify average recurring payment dues.
+--For each member sk_ticket, identify average recurring payment dues and the value of the most recent recurring payment.
 mbr_tick_recurring_dues AS (
     SELECT
           SK_TICKET
-        , COUNT(DISTINCT DATE(SK_DATE)) AS RECURR_PAY_COUNT
-        , ROUND(AVG(VALUE), 2) AS RECURR_AVG_DUES
-        , MAX(SK_DATE) AS LAST_RECURR_PAY_DATE
+        , COUNT(DISTINCT DATE(SK_DATE))
+              OVER (PARTITION BY SK_TICKET)           AS RECURR_PAY_COUNT
+        , ROUND(AVG(VALUE)
+              OVER (PARTITION BY SK_TICKET), 2)       AS RECURR_AVG_DUES
+        , MAX(SK_DATE)
+              OVER (PARTITION BY SK_TICKET)           AS LAST_RECURR_PAY_DATE
+        , ROUND(VALUE, 2)                             AS RECURR_LAST_DUES
     FROM mbr_tick_events_clean
     WHERE EVENTTYPE = 'Recurring Payment'
-    GROUP BY SK_TICKET
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY SK_TICKET ORDER BY SK_DATE DESC, SK_TIME DESC
+    ) = 1
 ),
 --Track only the most recent upgrade event per ticket. Capture the upgrade on the parent sk_ticket only; the associated child sk_ticket should not reflect a separate upgrade event.
 --Use rn = 1 to ensure the upgrade is the ticket's current state — tickets with a buried upgrade event followed by continued activity (e.g. recurring payments) are genuinely active and should not be flagged.
@@ -360,6 +366,7 @@ SELECT DISTINCT --Distinct to ensure that ANY TICKETID is duplicated (duplicated
     , t.RECURRINGPAYMENTFREQUENCY AS PAY_FREQ
     , ip.PAY_INITIAL
     , rd.RECURR_AVG_DUES
+    , rd.RECURR_LAST_DUES
     , rd.RECURR_PAY_COUNT
     , rd.LAST_RECURR_PAY_DATE AS RECURR_LAST_PAY_DATE 
     , CASE
